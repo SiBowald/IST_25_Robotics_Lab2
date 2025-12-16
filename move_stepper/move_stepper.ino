@@ -54,7 +54,7 @@ void setup() {
     // go down until the switch is reached
     moveMotor1( 10, sw1Pin );
     right -=10;
-    Serial.println(digitalRead(sw1Pin));
+    //Serial.println(digitalRead(sw1Pin));
   }
   Serial.print("Right at ");
   Serial.print(right);
