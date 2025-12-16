@@ -30,7 +30,7 @@ void setup() {
   pinMode(sw1Pin, INPUT);
   pinMode(sw2Pin, INPUT);
 
-
+  
   left = 0;
   right = 0;
 

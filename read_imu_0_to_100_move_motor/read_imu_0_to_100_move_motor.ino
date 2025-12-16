@@ -1,0 +1,391 @@
+// This is a script to translate two positions into a value between 0 and 100
+// Manual
+// 1. Go to the first position
+// 2. Press one of the end switches
+// 3. Release the switch and wait approximately 1s in the same position
+// 4. Go to the second position
+// 5. Press one of the end switches
+// 6. Release the switch and wait approximately 1s in the same position
+// 7. Let the motor do the initalisation
+// 8. After finishing the initalisation you should hear a sound
+// 9. Now you can move your arm between the two positions and the cart should move in the same way.
+
+#include <Wire.h>
+#include "ICM20600.h"
+
+// pins
+#define sw1Pin 10
+#define sw2Pin 11
+
+// stepper pins
+#define stepPin 8
+#define dirPin  9
+
+// settings
+#define CAL_SAMPLES 30
+#define CAL_DELAY_MS 5
+#define IDLE_TIME_MS 500
+
+// moving average window size
+#define MA_N 5
+
+// stepper speed / timing
+#define STEP_PERIOD_US 2000   // time between steps (smaller = faster)
+#define STEP_PULSE_US  5      // HIGH pulse width on STEP pin (typ. 2..10us)
+
+// stop jitter around target
+#define MOTOR_DEADBAND_STEPS 2
+// soft limits so motor does not press endstops during normal operation
+#define ENDSTOP_MARGIN_STEPS 50
+
+// global variables
+ICM20600 imu(true);
+
+// acceleration from the sensors
+int16_t ax, ay, az;
+
+// Pose vectors
+float poseA[3] = {0, 0, 0};
+float poseB[3] = {0, 0, 0};
+float angleAB = 0.0;  // radians between poseA and poseB
+
+// Moving average buffer
+int maBuf[MA_N];
+long maSum = 0;
+int maIdx = 0;
+int maCount = 0;
+
+// motor state
+long motorPosSteps = 0;   // current motor position in steps
+long rangeSteps    = 0;   // total travel sw1 -> sw2 (in steps)
+long targetSteps   = 0;   // desired motor position in steps (from pos 0..100)
+
+unsigned long nextStepUs = 0;  // scheduler for non-blocking stepping
+
+
+// helper functions:
+
+// returns 1 when no button pressed, 0 when any button pressed
+int buttonsReleased() {
+  return (digitalRead(sw1Pin) == 1) && (digitalRead(sw2Pin) == 1);
+}
+
+int buttonPressed() {
+  return !buttonsReleased();
+}
+
+// Keep the value between min and max value
+float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+// calculates the dot product of two 3-D vectors
+float dot3(float a[3], float b[3]) {
+  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+// turns a 3-D vector into a unit vector (length = 1)
+void normalize3(float v[3]) {
+  float m = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+  if (m < 1e-4) return; //prevents from crashing if zero
+  v[0] /= m;
+  v[1] /= m;
+  v[2] /= m;
+}
+
+// reset the moving average
+void resetMovingAverage() {
+  maSum = 0;
+  maIdx = 0;
+  maCount = 0;
+  for (int i = 0; i < MA_N; i++) 
+    maBuf[i] = 0;
+}
+
+// keeps a moving average (a rolling average) of the last MA_N values
+int pushMovingAverage(int v) {
+  if (maCount < MA_N) {
+    maBuf[maIdx] = v;
+    maSum += v;
+    maCount++;
+  } else {
+    maSum -= maBuf[maIdx];
+    maBuf[maIdx] = v;
+    maSum += v;
+  }
+  maIdx = (maIdx + 1) % MA_N;
+
+  // rounded average
+  return (int)((maSum + (maCount / 2)) / maCount);
+}
+
+// read the sensors
+void readAccel() {
+  ax = imu.getAccelerationX();
+  ay = imu.getAccelerationY();
+  az = imu.getAccelerationZ();
+}
+
+// capture a pose = average accel direction over CAL_SAMPLES samples
+void capturePose(float poseOut[3]) {
+  float sum[3] = {0, 0, 0};
+
+  for (int i = 0; i < CAL_SAMPLES; i++) {
+    readAccel();
+    sum[0] += (float)ax;
+    sum[1] += (float)ay;
+    sum[2] += (float)az;
+    delay(CAL_DELAY_MS);
+  }
+
+  sum[0] /= (float)CAL_SAMPLES;
+  sum[1] /= (float)CAL_SAMPLES;
+  sum[2] /= (float)CAL_SAMPLES;
+
+  normalize3(sum);
+
+  poseOut[0] = sum[0];
+  poseOut[1] = sum[1];
+  poseOut[2] = sum[2];
+}
+
+// convert current accel direction to 0-100 using angle from poseA
+int computePos0to100(float vUnit[3]) {
+  if (angleAB < 1e-4) return 0; //prevents from crashing if zero
+
+  float d = clampf(dot3(poseA, vUnit), -1.0, 1.0);
+  float angleAV = acos(d);      // 0 to pi
+  float t = angleAV / angleAB;  // normally 0..1
+  t = clampf(t, 0.0, 1.0);
+
+  int pos = (int)(t * 100.0 + 0.5); //+ 0.5 is there to round to the nearest integer instead of always truncating down.
+  if (pos < 0) pos = 0;
+  if (pos > 100) pos = 100;
+  return pos;
+}
+
+// executes exactly ONE step, direction depends on dirSign (+1 or -1)
+void doOneStep(int dirSign) {
+  if (dirSign > 0) {
+    digitalWrite(dirPin, HIGH);
+  } else {
+    digitalWrite(dirPin, LOW);
+  }
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(STEP_PULSE_US);
+  digitalWrite(stepPin, LOW);
+}
+
+void homeAndMeasureRange() {
+  Serial.println("Homing to sw1...");
+
+  // move until sw1 is pressed (LOW).
+  while (digitalRead(sw1Pin) == HIGH) {
+    doOneStep(-1);
+    delayMicroseconds(STEP_PERIOD_US);
+  }
+
+  // define "0" at the sw1 hit point for now
+  motorPosSteps = 0;
+
+  // back off until sw1 releases (or max steps)
+  for (int i = 0; i < ENDSTOP_MARGIN_STEPS; i++) {
+    if (digitalRead(sw1Pin) == HIGH) break;
+    doOneStep(+1);
+    delayMicroseconds(STEP_PERIOD_US);
+    motorPosSteps++; // moved away from sw1
+  }
+
+  Serial.println("Measuring travel to sw2...");
+  long count = 0;
+
+  // move until sw2 pressed (LOW).
+  while (digitalRead(sw2Pin) == HIGH) {
+    doOneStep(+1);
+    delayMicroseconds(STEP_PERIOD_US);
+    count++;
+  }
+
+  // count is hit-to-hit distance from sw1-hit to sw2-hit
+  rangeSteps = count;
+
+  // currently sitting at sw2-hit point, so position is rangeSteps
+  motorPosSteps = rangeSteps;
+
+  Serial.print("rangeSteps(hit-to-hit) = ");
+  Serial.println(rangeSteps);
+
+  // back off from sw2 until it releases (or ENDSTOP_MARGIN_STEPS)
+  for (int i = 0; i < ENDSTOP_MARGIN_STEPS; i++) {
+    if (digitalRead(sw2Pin) == HIGH) break;
+    doOneStep(-1);
+    delayMicroseconds(STEP_PERIOD_US);
+    motorPosSteps--; // moved away from sw2
+  }
+
+  Serial.print("motorPosSteps after backoff = ");
+  Serial.println(motorPosSteps);
+}
+
+long posToTargetSteps(int pos) {
+  if (pos < 0) pos = 0;
+  if (pos > 100) pos = 100;
+
+  long minSteps = ENDSTOP_MARGIN_STEPS;
+  long maxSteps = rangeSteps - ENDSTOP_MARGIN_STEPS;
+
+  // safety if range is tiny
+  if (maxSteps < minSteps) maxSteps = minSteps;
+
+  return minSteps + ((maxSteps - minSteps) * (long)pos) / 100L;
+}
+
+void stepperService() {
+  if (rangeSteps <= 0) return;
+
+  long err = targetSteps - motorPosSteps;
+  if (abs(err) <= MOTOR_DEADBAND_STEPS) return;
+
+  unsigned long now = micros();
+  if ((long)(now - nextStepUs) < 0) return;
+  nextStepUs = now + STEP_PERIOD_US;
+
+  int dirSign = (err > 0) ? +1 : -1;
+  int safetyPin = (dirSign > 0) ? sw2Pin : sw1Pin;
+
+  // endstop safety
+  if (digitalRead(safetyPin) == LOW) return;
+
+  doOneStep(dirSign);
+  motorPosSteps += dirSign;
+}
+
+// make sound
+void buzzStepper(unsigned int freqHz, unsigned int durationMs) {
+
+  // If an endstop is currently pressed, do nothing
+  if (digitalRead(sw1Pin) == LOW || digitalRead(sw2Pin) == LOW) return;
+
+  unsigned long periodUs = 1000000UL / freqHz;
+
+  // number of steps to execute
+  unsigned long stepsTotal = (unsigned long)freqHz * durationMs / 1000UL;
+
+  // make it so it ends where it started
+  if (stepsTotal & 1UL) stepsTotal--;
+
+  int dir = +1;
+  for (unsigned long i = 0; i < stepsTotal; i++) {
+    // safety: stop buzzing if an endstop gets hit
+    if (digitalRead(sw1Pin) == LOW || digitalRead(sw2Pin) == LOW) break;
+
+    doOneStep(dir);
+    dir = -dir;                         // alternate direction each step
+    delayMicroseconds(periodUs);
+  }
+}
+
+void playStartupSound() {
+  buzzStepper(800, 120);
+  delay(40);
+  buzzStepper(1100, 120);
+  delay(40);
+  buzzStepper(1400, 160);
+  delay(60);
+  buzzStepper(1000, 200);
+}
+
+// setup
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);
+
+  pinMode(sw1Pin, INPUT_PULLUP);
+  pinMode(sw2Pin, INPUT_PULLUP);
+
+  pinMode(stepPin, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+
+
+  imu.initialize();
+  resetMovingAverage();
+
+  Serial.println("Calibration");
+  Serial.println("Hold Pose A and PRESS any end switch...");
+
+  // wait for press
+  while (buttonsReleased()) {
+    // do nothing
+  }
+  capturePose(poseA);
+  Serial.println("Pose A saved.");
+
+  // wait for release
+  while (buttonPressed()) {
+    // do nothing
+  }
+
+  Serial.println("Release detected. Rotate arm now...");
+  delay(IDLE_TIME_MS);
+
+  Serial.println("Hold Pose B and PRESS any end switch...");
+
+  // wait for press
+  while (buttonsReleased()) {
+    // do nothing
+  }
+  capturePose(poseB);
+  Serial.println("Pose B saved.");
+
+  // wait for release
+  while (buttonPressed()) {
+    // do nothing
+  }
+
+  // compute angle between A and B
+  float d = clampf(dot3(poseA, poseB), -1.0, 1.0);
+  angleAB = acos(d);
+
+  Serial.print("Angle A->B (rad): ");
+  Serial.println(angleAB, 6);
+
+  if (angleAB < 0.2) {
+    Serial.println("ERROR: Poses too similar. Reset and try again with larger rotation.");
+    while (true);
+
+  } else {
+    Serial.println("Setup completed.");
+  }
+
+  homeAndMeasureRange();
+
+  Serial.println("Homing completed.");
+  playStartupSound();
+}
+
+void loop() {
+  readAccel();
+
+  float v[3] = { (float)ax, (float)ay, (float)az };
+  normalize3(v);
+
+  int posRaw = computePos0to100(v);
+  int pos    = pushMovingAverage(posRaw);
+
+  targetSteps = posToTargetSteps(pos);
+  stepperService();
+
+  // debug print
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 50) {   // print every 50 ms
+    lastPrint = millis();
+    Serial.print("pos:"); Serial.print(pos); Serial.print('\t');
+    Serial.print("posRaw:"); Serial.print(posRaw); Serial.print('\t');
+    Serial.print("motorPos:"); Serial.print(motorPosSteps); Serial.print('\t');
+    Serial.print("target:"); Serial.print(targetSteps); Serial.print('\t');
+    Serial.println();
+  }
+}
+

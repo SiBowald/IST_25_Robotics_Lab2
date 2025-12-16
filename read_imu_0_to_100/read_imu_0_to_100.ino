@@ -141,7 +141,7 @@ int computePos0to100(float vUnit[3]) {
   return pos;
 }
 
-// ------------------------- setup ----------------------------
+// setup
 void setup() {
   Wire.begin();
   Serial.begin(115200);
