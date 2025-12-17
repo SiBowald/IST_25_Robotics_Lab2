@@ -27,14 +27,15 @@
 #define IDLE_TIME_MS 500
 
 // moving average window size
-#define MA_N 5
+#define MA_N 15
 
 // stepper speed / timing
 #define STEP_PERIOD_US 2000   // time between steps (smaller = faster)
-#define STEP_PULSE_US  5      // HIGH pulse width on STEP pin (typ. 2..10us)
+#define STEP_PULSE_US  10      // HIGH pulse width on STEP pin
+
 
 // stop jitter around target
-#define MOTOR_DEADBAND_STEPS 2
+#define MOTOR_DEADBAND_STEPS 10
 // soft limits so motor does not press endstops during normal operation
 #define ENDSTOP_MARGIN_STEPS 50
 
@@ -183,7 +184,7 @@ void homeAndMeasureRange() {
 
   // move until sw1 is pressed (LOW).
   while (digitalRead(sw1Pin) == HIGH) {
-    doOneStep(-1);
+    doOneStep(1);
     delayMicroseconds(STEP_PERIOD_US);
   }
 
@@ -193,7 +194,7 @@ void homeAndMeasureRange() {
   // back off until sw1 releases (or max steps)
   for (int i = 0; i < ENDSTOP_MARGIN_STEPS; i++) {
     if (digitalRead(sw1Pin) == HIGH) break;
-    doOneStep(+1);
+    doOneStep(-1);
     delayMicroseconds(STEP_PERIOD_US);
     motorPosSteps++; // moved away from sw1
   }
@@ -203,7 +204,7 @@ void homeAndMeasureRange() {
 
   // move until sw2 pressed (LOW).
   while (digitalRead(sw2Pin) == HIGH) {
-    doOneStep(+1);
+    doOneStep(-1);
     delayMicroseconds(STEP_PERIOD_US);
     count++;
   }
@@ -212,7 +213,8 @@ void homeAndMeasureRange() {
   rangeSteps = count;
 
   // currently sitting at sw2-hit point, so position is rangeSteps
-  motorPosSteps = rangeSteps;
+  //motorPosSteps = rangeSteps;
+  motorPosSteps = 0;
 
   Serial.print("rangeSteps(hit-to-hit) = ");
   Serial.println(rangeSteps);
@@ -220,7 +222,7 @@ void homeAndMeasureRange() {
   // back off from sw2 until it releases (or ENDSTOP_MARGIN_STEPS)
   for (int i = 0; i < ENDSTOP_MARGIN_STEPS; i++) {
     if (digitalRead(sw2Pin) == HIGH) break;
-    doOneStep(-1);
+    doOneStep(1);
     delayMicroseconds(STEP_PERIOD_US);
     motorPosSteps--; // moved away from sw2
   }
@@ -288,13 +290,13 @@ void buzzStepper(unsigned int freqHz, unsigned int durationMs) {
 }
 
 void playStartupSound() {
-  buzzStepper(800, 120);
-  delay(40);
-  buzzStepper(1100, 120);
-  delay(40);
-  buzzStepper(1400, 160);
-  delay(60);
-  buzzStepper(1000, 200);
+  delay(1000);
+  buzzStepper(880,  110);  delay(35);
+  buzzStepper(1109, 110);  delay(35);
+  buzzStepper(1319, 140);  delay(55);
+  buzzStepper(1760, 220);  delay(70);
+  buzzStepper(1319,  80);  delay(20);
+  buzzStepper(1760, 320);
 }
 
 // setup
