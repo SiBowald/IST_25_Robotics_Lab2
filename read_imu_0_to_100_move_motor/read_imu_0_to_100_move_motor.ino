@@ -29,15 +29,21 @@
 // moving average window size
 #define MA_N 15
 
-// stepper speed / timing
-#define STEP_PERIOD_US 2000   // time between steps (smaller = faster)
-#define STEP_PULSE_US  10      // HIGH pulse width on STEP pin
+// stepper speed and timing
+#define STEP_PERIOD_US 2000         // time between steps (smaller = faster)
+#define STEP_PULSE_US  10           // HIGH pulse width on STEP pin
 
+#define STEP_PERIOD_MAX_US 6000     // slowest (start speed)
+#define STEP_PERIOD_MIN_US 2000     // fastest (top speed)
+#define STEP_ACCEL_US      50       // how much period shrinks per step (acceleration)
+
+#define DECEL_WINDOW_STEPS 100      // start slowing down when close to target
+#define STEP_DECEL_US      50       // how much period grows per step (deceleration)
 
 // stop jitter around target
-#define MOTOR_DEADBAND_STEPS 10
+#define MOTOR_DEADBAND_STEPS 15
 // soft limits so motor does not press endstops during normal operation
-#define ENDSTOP_MARGIN_STEPS 50
+#define ENDSTOP_MARGIN_STEPS 100
 
 // global variables
 ICM20600 imu(true);
@@ -61,7 +67,10 @@ long motorPosSteps = 0;   // current motor position in steps
 long rangeSteps    = 0;   // total travel sw1 -> sw2 (in steps)
 long targetSteps   = 0;   // desired motor position in steps (from pos 0..100)
 
-unsigned long nextStepUs = 0;  // scheduler for non-blocking stepping
+unsigned long nextStepUs = 0;  // scheduler for non-blocking stepping -> the next step is allowed at this time.
+
+unsigned long stepPeriodUs = STEP_PERIOD_MAX_US; // current period between steps
+int lastDirSign = 0;                              // +1 / -1 of previous step
 
 
 // helper functions:
@@ -182,7 +191,7 @@ void doOneStep(int dirSign) {
 void homeAndMeasureRange() {
   Serial.println("Homing to sw1...");
 
-  // move until sw1 is pressed (LOW).
+  // move until sw1 is pressed (LOW)
   while (digitalRead(sw1Pin) == HIGH) {
     doOneStep(1);
     delayMicroseconds(STEP_PERIOD_US);
@@ -202,7 +211,7 @@ void homeAndMeasureRange() {
   Serial.println("Measuring travel to sw2...");
   long count = 0;
 
-  // move until sw2 pressed (LOW).
+  // move until sw2 pressed (LOW)
   while (digitalRead(sw2Pin) == HIGH) {
     doOneStep(-1);
     delayMicroseconds(STEP_PERIOD_US);
@@ -212,8 +221,6 @@ void homeAndMeasureRange() {
   // count is hit-to-hit distance from sw1-hit to sw2-hit
   rangeSteps = count;
 
-  // currently sitting at sw2-hit point, so position is rangeSteps
-  //motorPosSteps = rangeSteps;
   motorPosSteps = 0;
 
   Serial.print("rangeSteps(hit-to-hit) = ");
@@ -231,6 +238,11 @@ void homeAndMeasureRange() {
   Serial.println(motorPosSteps);
 }
 
+//clamps pos to 0–100 and linearly maps it to a step position between minSteps and maxSteps
+//where both ends are kept ENDSTOP_MARGIN_STEPS away from the endstops. This way pos=0 and pos=100 
+//correspond to safe positions near the switches without physically pressing them
+//Note: Since the electrical connections are not perfect some steps are missing and it looses
+//      track of the correct position
 long posToTargetSteps(int pos) {
   if (pos < 0) pos = 0;
   if (pos > 100) pos = 100;
@@ -248,21 +260,56 @@ void stepperService() {
   if (rangeSteps <= 0) return;
 
   long err = targetSteps - motorPosSteps;
-  if (abs(err) <= MOTOR_DEADBAND_STEPS) return;
 
-  unsigned long now = micros();
-  if ((long)(now - nextStepUs) < 0) return;
-  nextStepUs = now + STEP_PERIOD_US;
+  // reached target -> stop and reset speed
+  if (abs(err) <= MOTOR_DEADBAND_STEPS) {
+    stepPeriodUs = STEP_PERIOD_MAX_US;
+    lastDirSign = 0;
+    return;
+  }
 
-  int dirSign = (err > 0) ? +1 : -1;
-  int safetyPin = (dirSign > 0) ? sw2Pin : sw1Pin;
+  int dirSign;
+  if (err > 0) dirSign = +1;
+  else         dirSign = -1;
+
+  int safetyPin;
+  if (dirSign > 0) safetyPin = sw2Pin;  // moving toward sw2
+  else             safetyPin = sw1Pin;  // moving toward sw1
+
 
   // endstop safety
-  if (digitalRead(safetyPin) == LOW) return;
+  if (digitalRead(safetyPin) == LOW) {
+    stepPeriodUs = STEP_PERIOD_MAX_US;
+    lastDirSign = 0;
+    return;
+  }
 
+  // timing (uses the current stepPeriodUs)
+  unsigned long now = micros();
+  if ((long)(now - nextStepUs) < 0) return;
+  nextStepUs = now + stepPeriodUs;
+
+  // do one step
   doOneStep(dirSign);
   motorPosSteps += dirSign;
+
+  if (lastDirSign == dirSign) {
+    // same direction as last step -> speed up (smaller period)
+    if (stepPeriodUs > STEP_PERIOD_MIN_US + STEP_ACCEL_US) stepPeriodUs -= STEP_ACCEL_US;
+    else stepPeriodUs = STEP_PERIOD_MIN_US;
+  } else {
+    // direction changed -> go slow again
+    stepPeriodUs = STEP_PERIOD_MAX_US;
+  }
+  lastDirSign = dirSign;
+
+  // deceleration near target
+  if (abs(err) < DECEL_WINDOW_STEPS) {
+    if (stepPeriodUs + STEP_DECEL_US < STEP_PERIOD_MAX_US) stepPeriodUs += STEP_DECEL_US;
+    else stepPeriodUs = STEP_PERIOD_MAX_US;
+  }
 }
+
 
 // make sound
 void buzzStepper(unsigned int freqHz, unsigned int durationMs) {
@@ -290,7 +337,7 @@ void buzzStepper(unsigned int freqHz, unsigned int durationMs) {
 }
 
 void playStartupSound() {
-  delay(1000);
+  delay(500);
   buzzStepper(880,  110);  delay(35);
   buzzStepper(1109, 110);  delay(35);
   buzzStepper(1319, 140);  delay(55);
