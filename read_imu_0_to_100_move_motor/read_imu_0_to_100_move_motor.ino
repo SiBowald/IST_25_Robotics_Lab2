@@ -1,15 +1,16 @@
-// This is a script to translate two positions into a value between 0 and 100
 // Manual
 // 0. Make sure the cart is in the middle
 // 1. Go to the first pose with your hand
 // 2. Press one of the end switches
-// 3. Release the switch and wait approximately 1s in the same pose
+// 3. Release the switch and wait approximately 1s in the same pose  -> Vector is saved as A
 // 4. Go to the second pose
 // 5. Press one of the end switches
-// 6. Release the switch and wait approximately 1s in the same pose
+// 6. Release the switch and wait approximately 1s in the same pose  -> Vector is saved as B
+//    Angle between A and B is calculated. A = 0 / B = 1
 // 7. Let the motor do the initalisation
 // 8. After finishing the initalisation you should hear a sound
-// 9. Now you can move your arm between the two positions and the cart should move in the same way.
+// 9. Now you can move your arm between the two poses and the cart should move in the same way.
+//    You can also move into a other direction up to the previously calculated angle A/B
 
 #include <Wire.h>
 #include "ICM20600.h"
@@ -37,21 +38,18 @@
 #define STEP_PERIOD_US 2000         // time between steps (smaller = faster)
 #define STEP_PULSE_US  10           // HIGH pulse width on STEP pin
 
-#define STEP_PERIOD_MAX_US 10000     // slowest (start speed)
+#define STEP_PERIOD_MAX_US 10000    // slowest (start speed)
 #define STEP_PERIOD_MIN_US 2000     // fastest (top speed)
 #define ACCEL_MULT_PERMILLE 985     // reduce the time between steps
 #define DECEL_MULT_PERMILLE 1015    // increase the time between steps
-
-
 #define DECEL_WINDOW_STEPS 100      // start slowing down when close to target
-#define STEP_DECEL_US      50       // how much period grows per step (deceleration)
 
 // stop jitter around target
 #define MOTOR_DEADBAND_STEPS 15
 // soft limits so motor does not press endstops during normal operation
 #define ENDSTOP_MARGIN_STEPS 100
-
-#define TARGET_HYST_STEPS 15   // ignore target changes smaller than this
+// ignore target changes smaller than this
+#define TARGET_HYST_STEPS 15
 
 // global variables
 ICM20600 imu(true);
@@ -75,7 +73,8 @@ long motorPosSteps = 0;   // current motor position in steps
 long rangeSteps    = 0;   // total travel sw1 -> sw2 (in steps)
 long targetSteps   = 0;   // desired motor position in steps (from pos 0..100)
 
-unsigned long nextStepUs = 0;  // scheduler for non-blocking stepping -> the next step is allowed at this time.
+// scheduler for non-blocking stepping -> the next step is allowed at this time
+unsigned long nextStepUs = 0;
 
 unsigned long stepPeriodUs = STEP_PERIOD_MAX_US; // current period between steps
 int lastDirSign = 0;                              // +1 / -1 of previous step
@@ -166,21 +165,6 @@ void capturePose(float poseOut[3]) {
   poseOut[2] = sum[2];
 }
 
-// convert current accel direction to 0-100 using angle from poseA
-int computePos0to100(float vUnit[3]) {
-  if (angleAB < 1e-4) return 0; //prevents from crashing if zero
-
-  float d = clampf(dot3(poseA, vUnit), -1.0, 1.0);
-  float angleAV = acos(d);      // 0 to pi
-  float t = angleAV / angleAB;  // normally 0..1
-  t = clampf(t, 0.0, 1.0);
-
-  int pos = (int)(t * 100.0 + 0.5); //+ 0.5 is there to round to the nearest integer instead of always truncating down.
-  if (pos < 0) pos = 0;
-  if (pos > 100) pos = 100;
-  return pos;
-}
-
 // executes exactly ONE step, direction depends on dirSign (+1 or -1)
 void doOneStep(int dirSign) {
   if (dirSign > 0) {
@@ -198,7 +182,7 @@ void homeAndMeasureRange() {
 
   // move until sw1 is pressed (LOW)
   while (digitalRead(sw1Pin) == HIGH) {
-    doOneStep(1);
+    doOneStep(DIR_TO_SW1);
     delayMicroseconds(STEP_PERIOD_US);
   }
 
@@ -208,23 +192,25 @@ void homeAndMeasureRange() {
   // back off until sw1 releases (or max steps)
   for (int i = 0; i < ENDSTOP_MARGIN_STEPS; i++) {
     if (digitalRead(sw1Pin) == HIGH) break;
-    doOneStep(-1);
+    doOneStep(DIR_TO_SW2);
     delayMicroseconds(STEP_PERIOD_US);
     motorPosSteps++; // moved away from sw1
   }
+
+  long backoff1 = motorPosSteps;   // remember how far we backed off
 
   Serial.println("Measuring travel to sw2...");
   long count = 0;
 
   // move until sw2 pressed (LOW)
   while (digitalRead(sw2Pin) == HIGH) {
-    doOneStep(-1);
+    doOneStep(DIR_TO_SW2);
     delayMicroseconds(STEP_PERIOD_US);
     count++;
   }
 
   // count is hit-to-hit distance from sw1-hit to sw2-hit
-  rangeSteps = count;
+  rangeSteps = backoff1 + count;
 
   motorPosSteps = rangeSteps;
 
@@ -234,7 +220,7 @@ void homeAndMeasureRange() {
   // back off from sw2 until it releases (or ENDSTOP_MARGIN_STEPS)
   for (int i = 0; i < ENDSTOP_MARGIN_STEPS; i++) {
     if (digitalRead(sw2Pin) == HIGH) break;
-    doOneStep(1);
+    doOneStep(DIR_TO_SW1);
     delayMicroseconds(STEP_PERIOD_US);
     motorPosSteps--; // moved away from sw2
   }
@@ -259,6 +245,7 @@ long posToTargetSteps(float pos) {
   return minSteps + (long)((maxSteps - minSteps) * pos + 0.5f);
 }
 
+//Calculates the angle between new vector and vector A and outputs its angle 0-1
 float compute01(float vUnit[3]) {
   float d = clampf(dot3(poseA, vUnit), -1.0, 1.0);
   float angleAV = acos(d);
@@ -305,7 +292,6 @@ void stepperService() {
 
   // accelleration and deacceleration
   bool decel = (abs(err) < DECEL_WINDOW_STEPS);
-
   if (lastDirSign != dirSign) {
     // direction changed -> reset to slow
     stepPeriodUs = STEP_PERIOD_MAX_US;
