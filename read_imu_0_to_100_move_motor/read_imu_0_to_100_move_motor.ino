@@ -1,11 +1,12 @@
 // This is a script to translate two positions into a value between 0 and 100
 // Manual
-// 1. Go to the first position
+// 0. Make sure the cart is in the middle
+// 1. Go to the first pose with your hand
 // 2. Press one of the end switches
-// 3. Release the switch and wait approximately 1s in the same position
-// 4. Go to the second position
+// 3. Release the switch and wait approximately 1s in the same pose
+// 4. Go to the second pose
 // 5. Press one of the end switches
-// 6. Release the switch and wait approximately 1s in the same position
+// 6. Release the switch and wait approximately 1s in the same pose
 // 7. Let the motor do the initalisation
 // 8. After finishing the initalisation you should hear a sound
 // 9. Now you can move your arm between the two positions and the cart should move in the same way.
@@ -21,21 +22,26 @@
 #define stepPin 8
 #define dirPin  9
 
+#define DIR_TO_SW1  (+1)
+#define DIR_TO_SW2  (-1)
+
 // settings
 #define CAL_SAMPLES 30
 #define CAL_DELAY_MS 5
 #define IDLE_TIME_MS 500
 
 // moving average window size
-#define MA_N 15
+#define MA_N 100
 
 // stepper speed and timing
 #define STEP_PERIOD_US 2000         // time between steps (smaller = faster)
 #define STEP_PULSE_US  10           // HIGH pulse width on STEP pin
 
-#define STEP_PERIOD_MAX_US 6000     // slowest (start speed)
+#define STEP_PERIOD_MAX_US 10000     // slowest (start speed)
 #define STEP_PERIOD_MIN_US 2000     // fastest (top speed)
-#define STEP_ACCEL_US      50       // how much period shrinks per step (acceleration)
+#define ACCEL_MULT_PERMILLE 985     // reduce the time between steps
+#define DECEL_MULT_PERMILLE 1015    // increase the time between steps
+
 
 #define DECEL_WINDOW_STEPS 100      // start slowing down when close to target
 #define STEP_DECEL_US      50       // how much period grows per step (deceleration)
@@ -44,6 +50,8 @@
 #define MOTOR_DEADBAND_STEPS 15
 // soft limits so motor does not press endstops during normal operation
 #define ENDSTOP_MARGIN_STEPS 100
+
+#define TARGET_HYST_STEPS 15   // ignore target changes smaller than this
 
 // global variables
 ICM20600 imu(true);
@@ -57,10 +65,10 @@ float poseB[3] = {0, 0, 0};
 float angleAB = 0.0;  // radians between poseA and poseB
 
 // Moving average buffer
-int maBuf[MA_N];
-long maSum = 0;
-int maIdx = 0;
-int maCount = 0;
+float posBuf[MA_N];
+float posSum = 0.0f;
+int posIdx = 0;
+int posCount = 0;
 
 // motor state
 long motorPosSteps = 0;   // current motor position in steps
@@ -106,29 +114,26 @@ void normalize3(float v[3]) {
 }
 
 // reset the moving average
-void resetMovingAverage() {
-  maSum = 0;
-  maIdx = 0;
-  maCount = 0;
-  for (int i = 0; i < MA_N; i++) 
-    maBuf[i] = 0;
+void resetPosMovingAverage() {
+  posSum = 0.0f;
+  posIdx = 0;
+  posCount = 0;
+  for (int i = 0; i < MA_N; i++) posBuf[i] = 0.0f;
 }
 
 // keeps a moving average (a rolling average) of the last MA_N values
-int pushMovingAverage(int v) {
-  if (maCount < MA_N) {
-    maBuf[maIdx] = v;
-    maSum += v;
-    maCount++;
+float pushPosMovingAverage(float v) {
+  if (posCount < MA_N) {
+    posBuf[posIdx] = v;
+    posSum += v;
+    posCount++;
   } else {
-    maSum -= maBuf[maIdx];
-    maBuf[maIdx] = v;
-    maSum += v;
+    posSum -= posBuf[posIdx];
+    posBuf[posIdx] = v;
+    posSum += v;
   }
-  maIdx = (maIdx + 1) % MA_N;
-
-  // rounded average
-  return (int)((maSum + (maCount / 2)) / maCount);
+  posIdx = (posIdx + 1) % MA_N;
+  return posSum / (float)posCount;
 }
 
 // read the sensors
@@ -221,7 +226,7 @@ void homeAndMeasureRange() {
   // count is hit-to-hit distance from sw1-hit to sw2-hit
   rangeSteps = count;
 
-  motorPosSteps = 0;
+  motorPosSteps = rangeSteps;
 
   Serial.print("rangeSteps(hit-to-hit) = ");
   Serial.println(rangeSteps);
@@ -238,22 +243,27 @@ void homeAndMeasureRange() {
   Serial.println(motorPosSteps);
 }
 
-//clamps pos to 0–100 and linearly maps it to a step position between minSteps and maxSteps
+//clamps pos to 0–1 and linearly maps it to a step position between minSteps and maxSteps
 //where both ends are kept ENDSTOP_MARGIN_STEPS away from the endstops. This way pos=0 and pos=100 
 //correspond to safe positions near the switches without physically pressing them
 //Note: Since the electrical connections are not perfect some steps are missing and it looses
 //      track of the correct position
-long posToTargetSteps(int pos) {
-  if (pos < 0) pos = 0;
-  if (pos > 100) pos = 100;
+long posToTargetSteps(float pos) {
+  if (pos < 0.0f) pos = 0.0f;
+  if (pos > 1.0f) pos = 1.0f;
 
   long minSteps = ENDSTOP_MARGIN_STEPS;
   long maxSteps = rangeSteps - ENDSTOP_MARGIN_STEPS;
-
-  // safety if range is tiny
   if (maxSteps < minSteps) maxSteps = minSteps;
 
-  return minSteps + ((maxSteps - minSteps) * (long)pos) / 100L;
+  return minSteps + (long)((maxSteps - minSteps) * pos + 0.5f);
+}
+
+float compute01(float vUnit[3]) {
+  float d = clampf(dot3(poseA, vUnit), -1.0, 1.0);
+  float angleAV = acos(d);
+  float t = angleAV / angleAB;
+  return clampf(t, 0.0, 1.0);
 }
 
 void stepperService() {
@@ -269,13 +279,12 @@ void stepperService() {
   }
 
   int dirSign;
-  if (err > 0) dirSign = +1;
-  else         dirSign = -1;
+  if (err > 0) dirSign = DIR_TO_SW2;
+  else         dirSign = DIR_TO_SW1;
 
   int safetyPin;
-  if (dirSign > 0) safetyPin = sw2Pin;  // moving toward sw2
-  else             safetyPin = sw1Pin;  // moving toward sw1
-
+  if (dirSign == DIR_TO_SW2) safetyPin = sw2Pin;
+  else                       safetyPin = sw1Pin;
 
   // endstop safety
   if (digitalRead(safetyPin) == LOW) {
@@ -291,23 +300,27 @@ void stepperService() {
 
   // do one step
   doOneStep(dirSign);
-  motorPosSteps += dirSign;
+  if (dirSign == DIR_TO_SW2) motorPosSteps += 1;   // moved toward sw2 => position increases
+  else                       motorPosSteps -= 1;
 
-  if (lastDirSign == dirSign) {
-    // same direction as last step -> speed up (smaller period)
-    if (stepPeriodUs > STEP_PERIOD_MIN_US + STEP_ACCEL_US) stepPeriodUs -= STEP_ACCEL_US;
-    else stepPeriodUs = STEP_PERIOD_MIN_US;
-  } else {
-    // direction changed -> go slow again
+  // accelleration and deacceleration
+  bool decel = (abs(err) < DECEL_WINDOW_STEPS);
+
+  if (lastDirSign != dirSign) {
+    // direction changed -> reset to slow
     stepPeriodUs = STEP_PERIOD_MAX_US;
+  } else {
+    if (decel) {
+      stepPeriodUs = (stepPeriodUs * (unsigned long)DECEL_MULT_PERMILLE) / 1000UL;
+      if (stepPeriodUs > STEP_PERIOD_MAX_US) stepPeriodUs = STEP_PERIOD_MAX_US;
+    } else {
+      stepPeriodUs = (stepPeriodUs * (unsigned long)ACCEL_MULT_PERMILLE) / 1000UL;
+      if (stepPeriodUs < STEP_PERIOD_MIN_US) stepPeriodUs = STEP_PERIOD_MIN_US;
+    }
   }
+
   lastDirSign = dirSign;
 
-  // deceleration near target
-  if (abs(err) < DECEL_WINDOW_STEPS) {
-    if (stepPeriodUs + STEP_DECEL_US < STEP_PERIOD_MAX_US) stepPeriodUs += STEP_DECEL_US;
-    else stepPeriodUs = STEP_PERIOD_MAX_US;
-  }
 }
 
 
@@ -359,7 +372,7 @@ void setup() {
 
 
   imu.initialize();
-  resetMovingAverage();
+  resetPosMovingAverage();
 
   Serial.println("Calibration");
   Serial.println("Hold Pose A and PRESS any end switch...");
@@ -409,9 +422,10 @@ void setup() {
   }
 
   homeAndMeasureRange();
+  targetSteps = motorPosSteps;
 
   Serial.println("Homing completed.");
-  playStartupSound();
+  //playStartupSound();
 }
 
 void loop() {
@@ -420,20 +434,31 @@ void loop() {
   float v[3] = { (float)ax, (float)ay, (float)az };
   normalize3(v);
 
-  int posRaw = computePos0to100(v);
-  int pos    = pushMovingAverage(posRaw);
+  float posRaw = compute01(v);          // 0..1
+  float pos    = pushPosMovingAverage(posRaw);
 
-  targetSteps = posToTargetSteps(pos);
+  static unsigned long lastTargetUpdateMs = 0;
+
+  long newTarget = posToTargetSteps(pos);
+
+  if (millis() - lastTargetUpdateMs >= 20) {
+    if (labs(newTarget - targetSteps) > TARGET_HYST_STEPS) {
+      targetSteps = newTarget;
+      lastTargetUpdateMs = millis();
+    }
+  }
+
+
   stepperService();
 
   // debug print
   static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 50) {   // print every 50 ms
+  if (millis() - lastPrint > 50) {
     lastPrint = millis();
-    Serial.print("pos:"); Serial.print(pos); Serial.print('\t');
-    Serial.print("posRaw:"); Serial.print(posRaw); Serial.print('\t');
+    Serial.print("pos:"); Serial.print(pos, 3); Serial.print('\t');
+    Serial.print("posRaw:"); Serial.print(posRaw, 3); Serial.print('\t');
     Serial.print("motorPos:"); Serial.print(motorPosSteps); Serial.print('\t');
-    Serial.print("target:"); Serial.print(targetSteps); Serial.print('\t');
+    Serial.print("target:"); Serial.print(targetSteps);
     Serial.println();
   }
 }
